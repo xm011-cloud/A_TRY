@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""
+批量文件重命名工具 - 图形界面版
+支持拖拽文件/文件夹，支持多种重命名规则
+"""
+
+import os
+import re
+import shutil
+import threading
+from pathlib import Path
+from typing import List, Tuple, Optional
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+# 尝试导入拖拽支持
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    HAS_DND = True
+except ImportError:
+    HAS_DND = False
+    # 降级使用普通 tk
+    TkinterDnD = tk.Tk
+
+
+class FileRenamerGUI:
+    def __init__(self):
+        self.root = TkinterDnD.Tk() if HAS_DND else tk.Tk()
+        self.root.title("批量文件重命名工具")
+        self.root.geometry("900x700")
+        self.root.minsize(800, 600)
+
+        # 数据
+        self.files: List[Path] = []           # 原始文件路径列表
+        self.preview_data: List[Tuple[Path, Path]] = []  # (src, dst) 预览
+
+        # 创建界面
+        self.create_widgets()
+        self.setup_drag_drop()
+
+        # 变量绑定
+        self.update_preview()
+
+        self.root.mainloop()
+
+    def create_widgets(self):
+        """创建所有控件"""
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # ========== 文件列表区域 ==========
+        list_frame = ttk.LabelFrame(main_frame, text="文件列表 (支持拖拽文件/文件夹)", padding="5")
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        # 按钮栏
+        btn_frame = ttk.Frame(list_frame)
+        btn_frame.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Button(btn_frame, text="添加文件", command=self.add_files).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="添加文件夹", command=self.add_folder).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="清空全部", command=self.clear_files).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="移除选中", command=self.remove_selected).pack(side=tk.LEFT, padx=2)
+
+        # 递归子目录选项（添加文件夹时生效）
+        self.recursive_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(btn_frame, text="递归子目录", variable=self.recursive_var).pack(side=tk.LEFT, padx=(10, 0))
+
+        # 文件列表（带滚动条）
+        list_container = ttk.Frame(list_frame)
+        list_container.pack(fill=tk.BOTH, expand=True)
+
+        self.file_listbox = tk.Listbox(list_container, selectmode=tk.EXTENDED)
+        scrollbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.file_listbox.yview)
+        self.file_listbox.configure(yscrollcommand=scrollbar.set)
+        self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # ========== 规则设置区域 ==========
+        rule_frame = ttk.LabelFrame(main_frame, text="重命名规则", padding="10")
+        rule_frame.pack(fill=tk.X, pady=(0, 10))
+
+        # 使用网格布局
+        row = 0
+
+        # 1. 字符串替换
+        ttk.Label(rule_frame, text="替换:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+        self.replace_old = tk.StringVar()
+        self.replace_new = tk.StringVar()
+        ttk.Entry(rule_frame, textvariable=self.replace_old, width=20).grid(row=row, column=1, padx=5, pady=2)
+        ttk.Label(rule_frame, text="→").grid(row=row, column=2, padx=5)
+        ttk.Entry(rule_frame, textvariable=self.replace_new, width=20).grid(row=row, column=3, padx=5, pady=2)
+        row += 1
+
+        # 2. 前缀/后缀
+        ttk.Label(rule_frame, text="前缀:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+        self.prefix = tk.StringVar()
+        ttk.Entry(rule_frame, textvariable=self.prefix, width=20).grid(row=row, column=1, padx=5, pady=2)
+
+        ttk.Label(rule_frame, text="后缀:").grid(row=row, column=2, sticky=tk.W, padx=5, pady=2)
+        self.suffix = tk.StringVar()
+        ttk.Entry(rule_frame, textvariable=self.suffix, width=20).grid(row=row, column=3, padx=5, pady=2)
+        row += 1
+
+        # 3. 正则替换
+        ttk.Label(rule_frame, text="正则替换:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+        self.regex_pattern = tk.StringVar()
+        self.regex_repl = tk.StringVar()
+        ttk.Entry(rule_frame, textvariable=self.regex_pattern, width=20).grid(row=row, column=1, padx=5, pady=2)
+        ttk.Label(rule_frame, text="→").grid(row=row, column=2, padx=5)
+        ttk.Entry(rule_frame, textvariable=self.regex_repl, width=20).grid(row=row, column=3, padx=5, pady=2)
+
+        self.ignore_case = tk.BooleanVar(value=False)
+        ttk.Checkbutton(rule_frame, text="忽略大小写", variable=self.ignore_case).grid(row=row, column=4, padx=5)
+        row += 1
+
+        # 4. 序号模式
+        ttk.Label(rule_frame, text="序号模式:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+        self.number_pattern = tk.StringVar()
+        self.number_pattern.set("")  # 例如 "img_{:03d}"
+        ttk.Entry(rule_frame, textvariable=self.number_pattern, width=30).grid(row=row, column=1, columnspan=2, sticky=tk.W, padx=5, pady=2)
+        ttk.Label(rule_frame, text="(例如: photo_{:03d} → photo_001.jpg)").grid(row=row, column=3, columnspan=2, sticky=tk.W, padx=5)
+        row += 1
+
+        # 5. 扩展名过滤（可选）
+        ttk.Label(rule_frame, text="仅处理扩展名:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+        self.ext_filter = tk.StringVar()
+        ttk.Entry(rule_frame, textvariable=self.ext_filter, width=20).grid(row=row, column=1, sticky=tk.W, padx=5, pady=2)
+        ttk.Label(rule_frame, text="(多个用逗号分隔，如 .jpg,.png)").grid(row=row, column=2, columnspan=3, sticky=tk.W, padx=5)
+        row += 1
+
+        # 6. 文件名匹配（正则筛选）
+        ttk.Label(rule_frame, text="筛选文件名:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+        self.name_filter = tk.StringVar()
+        ttk.Entry(rule_frame, textvariable=self.name_filter, width=30).grid(row=row, column=1, columnspan=2, sticky=tk.W, padx=5, pady=2)
+        ttk.Label(rule_frame, text="(正则匹配，不填则不过滤)").grid(row=row, column=3, columnspan=2, sticky=tk.W, padx=5)
+        row += 1
+
+        # ========== 预览和执行区域 ==========
+        preview_frame = ttk.LabelFrame(main_frame, text="预览 (将重命名的文件)", padding="5")
+        preview_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        preview_container = ttk.Frame(preview_frame)
+        preview_container.pack(fill=tk.BOTH, expand=True)
+
+        self.preview_text = tk.Text(preview_container, wrap=tk.NONE, height=12)
+        vsb = ttk.Scrollbar(preview_container, orient=tk.VERTICAL, command=self.preview_text.yview)
+        hsb = ttk.Scrollbar(preview_container, orient=tk.HORIZONTAL, command=self.preview_text.xview)
+        self.preview_text.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.preview_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # 按钮栏
+        action_frame = ttk.Frame(main_frame)
+        action_frame.pack(fill=tk.X)
+
+        ttk.Button(action_frame, text="刷新预览", command=self.update_preview).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="执行重命名", command=self.execute_rename).pack(side=tk.LEFT, padx=5)
+
+        # 状态栏
+        self.status_var = tk.StringVar()
+        self.status_var.set("就绪")
+        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # 规则改变时自动刷新预览
+        self.bind_events()
+
+    def bind_events(self):
+        """绑定输入框事件，自动刷新预览"""
+        vars_to_trace = [
+            self.replace_old, self.replace_new, self.prefix, self.suffix,
+            self.regex_pattern, self.regex_repl, self.number_pattern,
+            self.ext_filter, self.name_filter
+        ]
+        for var in vars_to_trace:
+            var.trace_add('write', lambda *_: self.update_preview())
+
+        self.ignore_case.trace_add('write', lambda *_: self.update_preview())
+
+    def setup_drag_drop(self):
+        """设置拖拽支持（如果可用）"""
+        if HAS_DND:
+            self.file_listbox.drop_target_register(DND_FILES)
+            self.file_listbox.dnd_bind('<<Drop>>', self.on_drop)
+            # 整个窗口也支持拖拽
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind('<<Drop>>', self.on_drop)
+
+    def on_drop(self, event):
+        """处理拖拽释放"""
+        # tkinterdnd2 返回的 data 格式：如果是多个文件，用空格或 {} 包裹
+        raw_data = event.data
+        paths = self.parse_drop_data(raw_data)
+        for p in paths:
+            self.add_path(p)
+        self.update_preview()
+
+    def parse_drop_data(self, data: str) -> List[str]:
+        """解析拖拽数据，支持文件和文件夹路径"""
+        # 处理 { } 包裹的路径（含空格的情况）
+        data = data.strip()
+        if data.startswith('{') and data.endswith('}'):
+            data = data[1:-1]
+        # 分割多个文件（Windows 拖拽多个文件以空格分隔，但路径可能含空格，此处简单处理）
+        # 更好的方法：检查是否存在 { } 或直接分割
+        # 为简单，假设用户拖拽单次少量文件，直接按空格分割可能出错，但常见场景可以接受
+        # 更精确的方式：使用 shlex.split，但需要额外处理 Windows 路径反斜杠
+        import shlex
+        try:
+            parts = shlex.split(data)
+        except:
+            parts = data.split()
+        return [os.path.normpath(p) for p in parts]
+
+    def add_files(self):
+        """通过对话框添加文件"""
+        paths = filedialog.askopenfilenames(title="选择文件")
+        for p in paths:
+            self.add_path(p)
+        self.update_preview()
+
+    def add_folder(self):
+        """添加文件夹中的所有文件（根据递归选项）"""
+        folder = filedialog.askdirectory(title="选择文件夹")
+        if not folder:
+            return
+        self.add_path(folder, is_folder=True)
+        self.update_preview()
+
+    def add_path(self, path: str, is_folder: bool = False):
+        """添加单个路径（文件或文件夹）到文件列表"""
+        p = Path(path)
+        if not p.exists():
+            return
+        if is_folder or p.is_dir():
+            # 添加文件夹内容
+            recursive = self.recursive_var.get()
+            if recursive:
+                files = list(p.rglob("*"))
+            else:
+                files = list(p.glob("*"))
+            # 只保留文件
+            files = [f for f in files if f.is_file()]
+            # 过滤扩展名（全局过滤会在预览时做，但这里先加入，后面统一过滤）
+            self.files.extend(files)
+        else:
+            # 单个文件
+            self.files.append(p)
+        # 去重（基于路径字符串）
+        self.files = list({str(f): f for f in self.files}.values())
+
+    def clear_files(self):
+        """清空所有文件"""
+        self.files.clear()
+        self.update_preview()
+
+    def remove_selected(self):
+        """移除选中的文件"""
+        selected_indices = self.file_listbox.curselection()
+        for idx in reversed(selected_indices):
+            if idx < len(self.files):
+                del self.files[idx]
+        self.update_preview()
+
+    def update_preview(self):
+        """根据当前规则生成预览"""
+        # 先更新文件列表显示
+        self.file_listbox.delete(0, tk.END)
+        for f in self.files:
+            self.file_listbox.insert(tk.END, str(f))
+
+        # 生成重命名预览
+        self.preview_data = []
+        if not self.files:
+            self.preview_text.delete(1.0, tk.END)
+            self.preview_text.insert(tk.END, "无文件")
+            self.status_var.set(f"文件数: 0")
+            return
+
+        # 过滤扩展名
+        ext_list = []
+        ext_filter_str = self.ext_filter.get().strip()
+        if ext_filter_str:
+            ext_list = [e.strip().lower() for e in ext_filter_str.split(',')]
+            # 确保以点开头
+            ext_list = [e if e.startswith('.') else f'.{e}' for e in ext_list]
+
+        # 筛选文件名正则
+        name_pattern = self.name_filter.get().strip()
+        name_regex = None
+        if name_pattern:
+            flags = re.IGNORECASE if self.ignore_case.get() else 0
+            try:
+                name_regex = re.compile(name_pattern, flags)
+            except re.error:
+                self.preview_text.delete(1.0, tk.END)
+                self.preview_text.insert(tk.END, "错误：筛选正则无效")
+                return
+
+        # 构建重命名函数
+        rename_func = self.build_rename_function()
+
+        # 对每个文件计算新名称
+        filtered_files = []
+        for src in self.files:
+            # 扩展名过滤
+            if ext_list and src.suffix.lower() not in ext_list:
+                continue
+            # 文件名正则筛选
+            if name_regex and not name_regex.search(src.name):
+                continue
+            filtered_files.append(src)
+
+        # 按文件名排序（保证序号一致）
+        filtered_files.sort(key=lambda p: p.name)
+
+        preview_lines = []
+        for idx, src in enumerate(filtered_files, start=1):
+            try:
+                new_name = rename_func(src, idx)
+                if not new_name:
+                    new_name = src.name
+                dst = src.parent / new_name
+                self.preview_data.append((src, dst))
+                preview_lines.append(f"{src.name}  →  {dst.name}")
+            except Exception as e:
+                preview_lines.append(f"{src.name}  →  错误: {e}")
+
+        # 显示预览
+        self.preview_text.delete(1.0, tk.END)
+        if preview_lines:
+            self.preview_text.insert(tk.END, "\n".join(preview_lines))
+        else:
+            self.preview_text.insert(tk.END, "没有符合过滤条件的文件")
+
+        self.status_var.set(f"文件总数: {len(self.files)} | 符合条件: {len(filtered_files)}")
+
+    def build_rename_function(self):
+        """根据界面规则构造重命名函数 (Path, index) -> new_name_str"""
+        rules = []
+
+        # 普通替换
+        old = self.replace_old.get()
+        new = self.replace_new.get()
+        if old:
+            rules.append(lambda name: name.replace(old, new))
+
+        # 前缀/后缀
+        prefix = self.prefix.get()
+        suffix = self.suffix.get()
+
+        def add_prefix(name):
+            return prefix + name if prefix else name
+
+        def add_suffix(name):
+            if not suffix:
+                return name
+            stem = Path(name).stem
+            ext = Path(name).suffix
+            return f"{stem}{suffix}{ext}"
+
+        if prefix:
+            rules.append(add_prefix)
+        if suffix:
+            rules.append(add_suffix)
+
+        # 正则替换
+        regex_pat = self.regex_pattern.get()
+        regex_repl = self.regex_repl.get()
+        if regex_pat:
+            flags = re.IGNORECASE if self.ignore_case.get() else 0
+            try:
+                regex = re.compile(regex_pat, flags)
+                rules.append(lambda name: regex.sub(regex_repl, name))
+            except re.error:
+                pass  # 无效正则忽略
+
+        # 序号模式（如果有，则覆盖所有前面的规则，仅保留序号+原扩展名）
+        number_pat = self.number_pattern.get().strip()
+        if number_pat:
+            # 序号模式专用函数，忽略其他规则
+            def number_rename(src: Path, idx: int) -> str:
+                return number_pat.format(idx) + src.suffix
+            return number_rename
+
+        # 无序号模式，组合规则
+        def combined_rename(src: Path, idx: int) -> str:
+            name = src.name
+            for rule in rules:
+                name = rule(name)
+            return name
+
+        return combined_rename
+
+    def execute_rename(self):
+        """执行重命名操作（带确认和错误处理）"""
+        if not self.preview_data:
+            messagebox.showinfo("提示", "没有要重命名的文件")
+            return
+
+        # 二次确认
+        confirm = messagebox.askyesno(
+            "确认重命名",
+            f"即将重命名 {len(self.preview_data)} 个文件。\n是否继续？",
+            icon='warning'
+        )
+        if not confirm:
+            return
+
+        success = 0
+        errors = []
+        # 为避免冲突，先检查所有目标是否存在
+        conflict = []
+        for src, dst in self.preview_data:
+            if dst.exists() and dst != src:
+                conflict.append((src, dst))
+        if conflict:
+            msg = "以下目标文件已存在，将被覆盖：\n" + "\n".join(f"{src.name} -> {dst.name}" for src, dst in conflict[:10])
+            if len(conflict) > 10:
+                msg += f"\n...等{len(conflict)}个"
+            msg += "\n\n是否继续？覆盖已存在的文件。"
+            if not messagebox.askyesno("冲突警告", msg, icon='warning'):
+                return
+
+        # 执行
+        for src, dst in self.preview_data:
+            try:
+                # 如果目标已存在且不同文件，先删除（覆盖）
+                if dst.exists() and dst != src:
+                    dst.unlink()
+                src.rename(dst)
+                success += 1
+            except Exception as e:
+                errors.append(f"{src.name} -> {dst.name}: {e}")
+
+        # 刷新列表（更新文件路径为新的）
+        # 简单处理：重新收集当前目录下的文件？但用户可能想继续操作，我们清空预览并重新加载新的文件名？
+        # 更好的方式：将 self.files 更新为重命名后的路径
+        new_files = []
+        for src, dst in self.preview_data:
+            if dst.exists():
+                new_files.append(dst)
+        self.files = new_files
+        self.update_preview()
+
+        msg = f"完成！成功 {success} 个，失败 {len(errors)} 个。"
+        if errors:
+            msg += "\n错误详情：\n" + "\n".join(errors[:5])
+        messagebox.showinfo("结果", msg)
+        self.status_var.set(msg)
+
+
+if __name__ == "__main__":
+    app = FileRenamerGUI()
