@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-批量文件重命名工具 - 图形界面版（优化窗口缩放）
-支持拖拽文件/文件夹，支持多种重命名规则，窗口自适应缩放
+批量文件重命名工具 - 图形界面版（优化窗口缩放 + 文件内容预览）
+支持拖拽文件/文件夹，支持多种重命名规则，双击文件列表预览内容
 """
 
 import os
 import re
-import threading
 from pathlib import Path
 from typing import List, Tuple
 import tkinter as tk
@@ -47,14 +46,14 @@ class FileRenamerGUI:
         # 主框架，填充整个窗口
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
-        # 配置主框架的行列权重：第0行（文件列表）和第2行（预览）可拉伸
+        # 配置主框架的行列权重
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(0, weight=3)   # 文件列表区域
         main_frame.rowconfigure(1, weight=0)   # 规则区域（固定高度）
         main_frame.rowconfigure(2, weight=2)   # 预览区域
 
         # ========== 1. 文件列表区域 ==========
-        list_frame = ttk.LabelFrame(main_frame, text="文件列表 (支持拖拽文件/文件夹)", padding="5")
+        list_frame = ttk.LabelFrame(main_frame, text="文件列表 (支持拖拽文件/文件夹，双击查看内容)", padding="5")
         list_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(1, weight=1)
@@ -62,7 +61,7 @@ class FileRenamerGUI:
         # 按钮栏
         btn_frame = ttk.Frame(list_frame)
         btn_frame.grid(row=0, column=0, sticky="ew", pady=(0, 5))
-        btn_frame.columnconfigure(7, weight=1)  # 右侧留空占位
+        btn_frame.columnconfigure(7, weight=1)
 
         ttk.Button(btn_frame, text="添加文件", command=self.add_files).grid(row=0, column=0, padx=2)
         ttk.Button(btn_frame, text="添加文件夹", command=self.add_folder).grid(row=0, column=1, padx=2)
@@ -84,10 +83,12 @@ class FileRenamerGUI:
         self.file_listbox.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
 
+        # 绑定双击预览事件
+        self.file_listbox.bind("<Double-Button-1>", self.on_file_double_click)
+
         # ========== 2. 规则设置区域 ==========
         rule_frame = ttk.LabelFrame(main_frame, text="重命名规则", padding="10")
         rule_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        # 规则区域使用网格布局，配置列权重使输入框可扩展
         for i in range(6):
             rule_frame.columnconfigure(i, weight=1 if i % 2 == 1 else 0)
 
@@ -147,7 +148,6 @@ class FileRenamerGUI:
         preview_frame.columnconfigure(0, weight=1)
         preview_frame.rowconfigure(0, weight=1)
 
-        # 文本框 + 双滚动条
         self.preview_text = tk.Text(preview_frame, wrap=tk.NONE, font=("Consolas", 9))
         vsb = ttk.Scrollbar(preview_frame, orient=tk.VERTICAL, command=self.preview_text.yview)
         hsb = ttk.Scrollbar(preview_frame, orient=tk.HORIZONTAL, command=self.preview_text.xview)
@@ -159,7 +159,7 @@ class FileRenamerGUI:
         # ========== 4. 底部按钮栏 ==========
         action_frame = ttk.Frame(main_frame)
         action_frame.grid(row=3, column=0, sticky="ew", pady=(10, 0))
-        action_frame.columnconfigure(2, weight=1)  # 右侧占位
+        action_frame.columnconfigure(2, weight=1)
 
         ttk.Button(action_frame, text="刷新预览", command=self.update_preview).grid(row=0, column=0, padx=5)
         ttk.Button(action_frame, text="执行重命名", command=self.execute_rename).grid(row=0, column=1, padx=5)
@@ -170,7 +170,6 @@ class FileRenamerGUI:
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
     def bind_events(self):
-        """规则输入框变更时自动刷新预览"""
         vars_to_trace = [
             self.replace_old, self.replace_new, self.prefix, self.suffix,
             self.regex_pattern, self.regex_repl, self.number_pattern,
@@ -229,7 +228,6 @@ class FileRenamerGUI:
             self.files.extend(files)
         else:
             self.files.append(p)
-        # 去重
         self.files = list({str(f): f for f in self.files}.values())
 
     def clear_files(self):
@@ -242,6 +240,126 @@ class FileRenamerGUI:
             if idx < len(self.files):
                 del self.files[idx]
         self.update_preview()
+
+    def on_file_double_click(self, event):
+        """双击文件列表项，查看文件内容"""
+        selection = self.file_listbox.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        if idx < len(self.files):
+            self.show_file_content(self.files[idx])
+
+    def show_file_content(self, file_path: Path):
+        """显示文件内容预览窗口（文本预览或二进制提示）"""
+        # 获取文件基本信息
+        try:
+            stat = file_path.stat()
+            size = stat.st_size
+            mtime = stat.st_mtime
+        except Exception as e:
+            messagebox.showerror("错误", f"无法读取文件信息: {e}")
+            return
+
+        # 创建预览窗口
+        win = tk.Toplevel(self.root)
+        win.title(f"文件内容预览 - {file_path.name}")
+        win.geometry("800x600")
+        win.minsize(400, 300)
+
+        # 顶部信息框架
+        info_frame = ttk.Frame(win, padding="5")
+        info_frame.pack(fill=tk.X, pady=(0, 5))
+        info_text = f"路径: {file_path}\n大小: {self.format_size(size)} | 修改时间: {self.format_time(mtime)}"
+        ttk.Label(info_frame, text=info_text, wraplength=780, justify=tk.LEFT).pack(anchor=tk.W)
+
+        # 内容显示区域（带滚动条）
+        txt_frame = ttk.Frame(win)
+        txt_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        text_widget = tk.Text(txt_frame, wrap=tk.NONE, font=("Consolas", 10))
+        vsb = ttk.Scrollbar(txt_frame, orient=tk.VERTICAL, command=text_widget.yview)
+        hsb = ttk.Scrollbar(txt_frame, orient=tk.HORIZONTAL, command=text_widget.xview)
+        text_widget.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        text_widget.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        txt_frame.columnconfigure(0, weight=1)
+        txt_frame.rowconfigure(0, weight=1)
+
+        # 判断是否为文本文件并显示内容
+        is_text, content_or_error = self.read_file_content(file_path)
+        if is_text:
+            text_widget.insert(tk.END, content_or_error)
+            text_widget.configure(state=tk.DISABLED)  # 只读
+        else:
+            text_widget.insert(tk.END, content_or_error)
+            text_widget.configure(state=tk.DISABLED)
+
+    def format_size(self, size: int) -> str:
+        """格式化文件大小"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024.0:
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} TB"
+
+    def format_time(self, timestamp: float) -> str:
+        """格式化修改时间"""
+        import datetime
+        dt = datetime.datetime.fromtimestamp(timestamp)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    def read_file_content(self, file_path: Path, max_size=1024*1024) -> Tuple[bool, str]:
+        """
+        尝试以文本方式读取文件内容。
+        返回 (是否为文本, 内容或错误提示)
+        """
+        # 首先检查文件大小
+        file_size = file_path.stat().st_size
+        if file_size > max_size:
+            return False, f"文件过大 ({self.format_size(file_size)})，超过预览上限（1MB）。\n请使用外部编辑器查看。"
+
+        # 根据扩展名快速判断是否为文本文件（常见文本扩展名）
+        text_extensions = {
+            '.txt', '.py', '.js', '.html', '.css', '.json', '.xml', '.csv', '.md',
+            '.ini', '.cfg', '.conf', '.log', '.bat', '.sh', '.c', '.cpp', '.h', '.java',
+            '.go', '.rs', '.swift', '.kt', '.rb', '.pl', '.php', '.sql', '.yaml', '.yml'
+        }
+        if file_path.suffix.lower() in text_extensions:
+            # 尝试读取
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                return True, content
+            except UnicodeDecodeError:
+                # 可能是其他编码，尝试常见编码
+                for enc in ['gbk', 'latin-1']:
+                    try:
+                        with open(file_path, 'r', encoding=enc) as f:
+                            content = f.read()
+                        return True, f"[使用编码 {enc} 读取]\n\n{content}"
+                    except:
+                        continue
+                return False, "文件可能是二进制文件，无法以文本方式显示。"
+
+        # 非文本扩展名，尝试检测内容是否为纯文本（读取前512字节判断）
+        try:
+            with open(file_path, 'rb') as f:
+                sample = f.read(512)
+            # 如果包含太多 null 字节或非可打印字符，视为二进制
+            if b'\x00' in sample:
+                return False, "文件为二进制文件，无法显示文本内容。"
+            # 尝试解码
+            try:
+                content = sample.decode('utf-8')
+                # 再读取全部（因为已经判断大小小于1MB）
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    full_content = f.read()
+                return True, full_content
+            except UnicodeDecodeError:
+                return False, "文件编码不是 UTF-8，且非纯文本格式，无法预览。"
+        except Exception as e:
+            return False, f"读取文件时出错: {e}"
 
     def update_preview(self):
         # 更新文件列表框显示
@@ -356,7 +474,6 @@ class FileRenamerGUI:
         if not messagebox.askyesno("确认重命名", f"即将重命名 {len(self.preview_data)} 个文件。\n是否继续？", icon='warning'):
             return
 
-        # 检查冲突
         conflicts = [(src, dst) for src, dst in self.preview_data if dst.exists() and dst != src]
         if conflicts:
             msg = "以下目标文件已存在，将被覆盖：\n" + "\n".join(f"{src.name} -> {dst.name}" for src, dst in conflicts[:10])
@@ -377,7 +494,6 @@ class FileRenamerGUI:
             except Exception as e:
                 errors.append(f"{src.name} -> {dst.name}: {e}")
 
-        # 更新文件列表为新路径
         new_files = [dst for _, dst in self.preview_data if dst.exists()]
         self.files = new_files
         self.update_preview()
